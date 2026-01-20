@@ -1,0 +1,4016 @@
+# AML Case Management System API
+#
+# OpenAPI 3.0 specification for the AML Case Management System.
+# Feature ID: 001-aml-case-management
+# Generated: 2026-01-18
+
+openapi: 3.0.3
+
+info:
+  title: "AML Case Management API"
+  version: "1.0.0"
+  description: |
+    API contracts for the AML Case Management System.
+
+    ## Overview
+
+    This API enables Spriggy to meet AUSTRAC AML/CTF compliance obligations by providing
+    endpoints for managing KYC remediation, PEP/Sanctions screening disposition, and
+    suspicious activity investigation workflows.
+
+    ## Authentication
+
+    All endpoints require Bearer token authentication via OIDC SSO integration (D5).
+    Include the token in the Authorization header:
+
+    ```
+    Authorization: Bearer <access_token>
+    ```
+
+    Webhook endpoints use HMAC signature validation instead of Bearer tokens (D11).
+
+    ## Roles
+
+    The system enforces four distinct roles (FR-063):
+    - **L1_ANALYST**: Triage and basic case handling
+    - **L2_ANALYST**: Full investigation and SMR recommendation authority
+    - **AML_MANAGER**: Approval authority for SMRs
+    - **READ_ONLY**: View and export only
+
+    ## Error Handling
+
+    All errors follow a consistent format with machine-readable codes.
+    See the ErrorResponse schema for details.
+
+    ## Optimistic Locking
+
+    Case mutations require a `version` field for optimistic locking (D8).
+    Version mismatch returns 409 Conflict.
+
+    ## Constitution Alignment
+
+    - **Principle I**: All mutating endpoints create audit log entries
+    - **Principle II**: Endpoints enforce role-based access
+    - **Principle VI**: No PII in response bodies except authorized fields
+    - **Principle VII**: 30s timeout on external calls; error responses include retry guidance
+  contact:
+    name: AML Compliance Team
+    email: aml-tech@spriggy.com.au
+
+servers:
+  - url: /api/v1
+    description: Production API
+
+tags:
+  - name: Webhooks
+    description: External system webhook receivers (GreenID, Indue)
+  - name: Cases
+    description: Case lifecycle management
+  - name: Queue
+    description: Case queue operations
+  - name: SMR
+    description: Suspicious Matter Report workflow
+  - name: Onboarding
+    description: Onboarding block management
+  - name: EDD
+    description: Enhanced Due Diligence checklist
+  - name: Communications
+    description: Customer communication records
+  - name: Investigation
+    description: Investigation findings documentation
+  - name: Dashboard
+    description: Analyst dashboard and metrics
+  - name: Reports
+    description: Operational and governance reports
+  - name: Notifications
+    description: User notification management
+  - name: Users
+    description: User management
+  - name: Configuration
+    description: System configuration
+
+# ============================================================================
+# PATHS
+# ============================================================================
+
+paths:
+  # --------------------------------------------------------------------------
+  # Webhook Endpoints (HMAC authenticated per D11)
+  # --------------------------------------------------------------------------
+
+  /webhooks/greenid:
+    post:
+      summary: Receive GreenID screening alert
+      description: |
+        Webhook endpoint for GreenID PEP/Sanctions screening alerts.
+
+        **Authentication**: HMAC signature in X-Signature-256 header (D11)
+
+        **Duplicate Handling**: Webhooks within 24-hour window for same
+        customer/alert-type are linked to existing case (EC-005, D3).
+
+        **Source Requirements**: FR-001, FR-002, FR-029, FR-030, FR-031, US-6, US-7
+      operationId: receiveGreenIdWebhook
+      tags:
+        - Webhooks
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookSignature'
+        - $ref: '#/components/parameters/WebhookTimestamp'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GreenIdWebhookPayload'
+      responses:
+        '202':
+          description: Webhook accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAcceptedResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Invalid HMAC signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: WEBHOOK_AUTH_FAILED
+                message: Invalid or missing webhook signature
+        '409':
+          description: Duplicate webhook (already processed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDuplicateResponse'
+
+  /webhooks/indue:
+    post:
+      summary: Receive Indue transaction monitoring alert
+      description: |
+        Webhook endpoint for Indue transaction monitoring alerts.
+
+        **Authentication**: HMAC signature in X-Signature-256 header (D11)
+
+        **Source Requirements**: FR-001, FR-002, US-3
+      operationId: receiveIndueWebhook
+      tags:
+        - Webhooks
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookSignature'
+        - $ref: '#/components/parameters/WebhookTimestamp'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IndueWebhookPayload'
+      responses:
+        '202':
+          description: Webhook accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAcceptedResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Invalid HMAC signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: WEBHOOK_AUTH_FAILED
+                message: Invalid or missing webhook signature
+        '409':
+          description: Duplicate webhook
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDuplicateResponse'
+
+  # --------------------------------------------------------------------------
+  # Case Endpoints
+  # --------------------------------------------------------------------------
+
+  /cases:
+    get:
+      summary: List cases
+      description: |
+        Retrieve paginated list of cases with filtering.
+        Default ordering: SLA urgency (most urgent first), then creation date (oldest first).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-024, FR-025, US-12
+      operationId: listCases
+      tags:
+        - Cases
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: status
+          in: query
+          description: Filter by case status
+          schema:
+            $ref: '#/components/schemas/CaseStatus'
+        - name: caseType
+          in: query
+          description: Filter by case type
+          schema:
+            $ref: '#/components/schemas/CaseType'
+        - name: assignedUserId
+          in: query
+          description: Filter by assigned analyst (use 'me' for current user, 'unassigned' for queue)
+          schema:
+            type: string
+        - name: tier
+          in: query
+          description: Filter by analyst tier
+          schema:
+            $ref: '#/components/schemas/Tier'
+        - name: slaStatus
+          in: query
+          description: Filter by SLA status
+          schema:
+            type: string
+            enum: [on_track, warning, breached]
+        - name: customerId
+          in: query
+          description: Filter by customer ID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: List of cases
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /cases/{caseId}:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Get case details
+      description: |
+        Retrieve full case details including timeline, communications, and related entities.
+
+        **Audit**: Creates CASE_VIEWED audit entry (FR-059)
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-059, US-1
+      operationId: getCase
+      tags:
+        - Cases
+      responses:
+        '200':
+          description: Case details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cases/{caseId}/claim:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Claim case from queue
+      description: |
+        Claim an unassigned case to the current analyst.
+
+        **State Transition**: OPEN -> IN_PROGRESS (explicit claim)
+
+        **Tier Restrictions**: L1 analysts can only claim L1-tier cases. Cases in ESCALATED status or
+        with tier=L2 require L2+ role. Attempting to claim a higher-tier case returns 403 TIER_MISMATCH.
+
+        **Optimistic Locking**: Requires version to prevent race conditions (D8, EC-001)
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: D13, EC-001
+      operationId: claimCase
+      tags:
+        - Cases
+        - Queue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimCaseRequest'
+      responses:
+        '200':
+          description: Case claimed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Insufficient role, case already assigned, or tier mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                alreadyAssigned:
+                  summary: Case already assigned
+                  value:
+                    code: CASE_ALREADY_ASSIGNED
+                    message: Case is already assigned to another analyst
+                tierMismatch:
+                  summary: L1 attempting to claim L2-tier case
+                  value:
+                    code: TIER_MISMATCH
+                    message: L1 analysts cannot claim L2-tier cases. Case has been escalated or requires L2+ authority.
+                    details:
+                      caseTier: L2
+                      userRole: L1_ANALYST
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+
+  /cases/{caseId}/close:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Close case
+      description: |
+        Close a case with documented disposition.
+
+        **Implicit Claim**: If case is unassigned (OPEN), closing atomically claims and closes it.
+
+        **L2 Review Flag**: L1 closures with SATISFACTORY_EXPLANATION set l2ReviewStatus to PENDING_REVIEW (FR-012).
+
+        **Tier Restrictions**: L1 analysts can only close L1-tier cases. Cases in ESCALATED status or
+        with tier=L2 require L2+ role. Attempting to close a higher-tier case returns 403 TIER_MISMATCH.
+
+        **State Transitions**:
+        - OPEN -> CLOSED (with implicit claim)
+        - IN_PROGRESS -> CLOSED
+        - PENDING_INFORMATION -> CLOSED
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-009, FR-011, FR-012, FR-015, US-1, US-13
+      operationId: closeCase
+      tags:
+        - Cases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseCaseRequest'
+      responses:
+        '200':
+          description: Case closed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '400':
+          description: Missing required documentation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: DOCUMENTATION_REQUIRED
+                message: Required closure documentation fields are missing
+                details:
+                  missingFields: [justification]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Insufficient role or tier mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                forbidden:
+                  summary: Insufficient role
+                  value:
+                    code: FORBIDDEN
+                    message: You do not have permission to perform this action
+                tierMismatch:
+                  summary: L1 attempting to close L2-tier case
+                  value:
+                    code: TIER_MISMATCH
+                    message: L1 analysts cannot close L2-tier cases. Case has been escalated or requires L2+ authority.
+                    details:
+                      caseTier: L2
+                      userRole: L1_ANALYST
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: INVALID_STATE_TRANSITION
+                message: Cannot close case in current state
+
+  /cases/{caseId}/escalate:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Escalate case to L2
+      description: |
+        Escalate case from L1 to L2 investigation queue with documented reasoning.
+
+        **State Transition**: IN_PROGRESS -> ESCALATED
+
+        **Roles**: L1_ANALYST only (L2+ already has authority)
+
+        **Source Requirements**: FR-013, US-3
+      operationId: escalateCase
+      tags:
+        - Cases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EscalateCaseRequest'
+      responses:
+        '200':
+          description: Case escalated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Only L1 analysts can escalate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: L1_ESCALATION_ONLY
+                message: Only L1 analysts can escalate cases to L2
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          description: Case not in escalatable state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cases/{caseId}/reopen:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Reopen closed case (L2 quality review)
+      description: |
+        Reopen a closed case as part of L2 quality review, overturning the L1 closure decision.
+        Case is assigned to the reopening L2 analyst.
+
+        **State Transition**: CLOSED -> IN_PROGRESS
+
+        **Side Effects**:
+        - Sets l2ReviewStatus to REVIEWED_REOPENED
+        - Creates assignment to L2 analyst
+        - Clears closedAt timestamp
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-018, FR-019, US-16
+      operationId: reopenCase
+      tags:
+        - Cases
+        - Queue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReopenCaseRequest'
+      responses:
+        '200':
+          description: Case reopened successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: L2+ role required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          description: Case is not closed or not an L1 closure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cases/{caseId}/request-information:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Record customer information request
+      description: |
+        Record an outbound customer communication requesting information.
+
+        **State Transition**: IN_PROGRESS -> PENDING_INFORMATION
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-010, FR-053, FR-055, US-2
+      operationId: requestInformation
+      tags:
+        - Cases
+        - Communications
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequestInformationRequest'
+      responses:
+        '200':
+          description: Communication recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+
+  /cases/{caseId}/record-response:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Record customer response
+      description: |
+        Record an inbound customer response and analyst assessment.
+
+        **State Transition**: PENDING_INFORMATION -> IN_PROGRESS
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-056, US-2
+      operationId: recordResponse
+      tags:
+        - Cases
+        - Communications
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordResponseRequest'
+      responses:
+        '200':
+          description: Response recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+
+  /cases/{caseId}/create-supplementary:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Create supplementary SMR case
+      description: |
+        Create a new case linked to a previously filed SMR for supplementary filing.
+
+        **Precondition**: Original case must have status SMR_FILED.
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-044, FR-045, FR-046, US-18
+      operationId: createSupplementaryCase
+      tags:
+        - Cases
+        - SMR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSupplementaryCaseRequest'
+      responses:
+        '201':
+          description: Supplementary case created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Original case not in SMR_FILED status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # --------------------------------------------------------------------------
+  # L2 Quality Review Queue
+  # --------------------------------------------------------------------------
+
+  /queue/l2-review:
+    get:
+      summary: List L1 closures pending L2 review
+      description: |
+        Retrieve cases closed by L1 with satisfactory explanation that are pending L2 quality review.
+
+        **Filter**: Cases where l2ReviewStatus = PENDING_REVIEW
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-012, FR-018, US-16
+      operationId: listL2ReviewQueue
+      tags:
+        - Queue
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: L2 review queue
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: L2+ role required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /queue/l2-review/{caseId}/accept:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Accept L1 closure decision
+      description: |
+        Accept an L1 closure decision as part of quality review. Case remains closed.
+
+        **Side Effect**: Sets l2ReviewStatus to REVIEWED_ACCEPTED
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-018
+      operationId: acceptL1Closure
+      tags:
+        - Queue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptL1ClosureRequest'
+      responses:
+        '200':
+          description: L1 closure accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Case not in L2 review queue
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /queue/unassigned:
+    get:
+      summary: List unassigned cases
+      description: |
+        Retrieve unassigned cases available for claiming, ordered by SLA urgency.
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: D13, FR-024, FR-025
+      operationId: listUnassignedQueue
+      tags:
+        - Queue
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: tier
+          in: query
+          description: Filter by analyst tier
+          schema:
+            $ref: '#/components/schemas/Tier'
+      responses:
+        '200':
+          description: Unassigned case queue
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # --------------------------------------------------------------------------
+  # Investigation Findings
+  # --------------------------------------------------------------------------
+
+  /cases/{caseId}/investigation-findings:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Get investigation findings
+      description: |
+        Retrieve investigation findings for a case.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: US-4
+      operationId: getInvestigationFindings
+      tags:
+        - Investigation
+      responses:
+        '200':
+          description: Investigation findings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvestigationFindingsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Case or findings not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    post:
+      summary: Create investigation findings
+      description: |
+        Document investigation findings for a case.
+
+        **Precondition**: Findings do not already exist for this case.
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: US-4, BR-INV-001
+      operationId: createInvestigationFindings
+      tags:
+        - Investigation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvestigationFindingsRequest'
+      responses:
+        '201':
+          description: Investigation findings created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvestigationFindingsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: L2+ role required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Investigation findings already exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      summary: Update investigation findings
+      description: |
+        Update existing investigation findings.
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: US-4
+      operationId: updateInvestigationFindings
+      tags:
+        - Investigation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateInvestigationFindingsRequest'
+      responses:
+        '200':
+          description: Investigation findings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvestigationFindingsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # SMR Workflow
+  # --------------------------------------------------------------------------
+
+  /cases/{caseId}/smr-recommendation:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Get SMR recommendation
+      description: |
+        Retrieve SMR recommendation for a case.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: US-4, US-5
+      operationId: getSMRRecommendation
+      tags:
+        - SMR
+      responses:
+        '200':
+          description: SMR recommendation details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMRRecommendationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      summary: Create SMR recommendation
+      description: |
+        Create an SMR recommendation for a case.
+
+        **Precondition**: Investigation findings must exist (BR-INV-002).
+
+        **State Transition**: IN_PROGRESS -> PENDING_APPROVAL
+
+        **Segregation**: Original recommender cannot approve (FR-020).
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-014, FR-039, US-4, BR-SMR-001
+      operationId: createSMRRecommendation
+      tags:
+        - SMR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSMRRecommendationRequest'
+      responses:
+        '201':
+          description: SMR recommendation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMRRecommendationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: L2+ role required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: L2_ROLE_REQUIRED
+                message: Only L2 analysts or higher can create SMR recommendations
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: SMR recommendation already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Investigation findings required first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: INVESTIGATION_FINDINGS_REQUIRED
+                message: Investigation findings must be documented before creating SMR recommendation
+
+  /cases/{caseId}/smr-recommendation/approve:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Approve SMR recommendation
+      description: |
+        Approve an SMR recommendation as AML Compliance Manager.
+
+        **Segregation**: Cannot approve your own recommendation (FR-020, EC-003).
+
+        **State Transition**: PENDING_APPROVAL -> CLOSED
+
+        **Side Effects**:
+        - Generates SMR draft document (FR-040)
+        - Creates notification to recommender
+
+        **Roles**: AML_MANAGER only
+
+        **Source Requirements**: FR-020, FR-021, FR-040, US-5, BR-SMR-002, BR-SMR-003
+      operationId: approveSMRRecommendation
+      tags:
+        - SMR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveSMRRequest'
+      responses:
+        '200':
+          description: SMR approved, draft generated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMRApprovalResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Cannot approve own recommendation or not AML Manager
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                segregationViolation:
+                  summary: Approving own recommendation
+                  value:
+                    code: SEGREGATION_VIOLATION
+                    message: Cannot approve your own SMR recommendation
+                roleRequired:
+                  summary: Not AML Manager
+                  value:
+                    code: AML_MANAGER_REQUIRED
+                    message: Only AML Compliance Manager can approve SMR recommendations
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: SMR not in PENDING status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cases/{caseId}/smr-recommendation/reject:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Reject SMR recommendation
+      description: |
+        Reject an SMR recommendation with feedback for revision.
+
+        **State Transition**: PENDING_APPROVAL -> IN_PROGRESS
+
+        **Side Effects**:
+        - Increments rejectionCount
+        - Adds entry to rejectionHistory
+        - Creates notification to recommender
+
+        **No Limit**: No system-imposed limit on rejections (EC-010).
+
+        **Roles**: AML_MANAGER only
+
+        **Source Requirements**: FR-021, FR-023, US-5, EC-010
+      operationId: rejectSMRRecommendation
+      tags:
+        - SMR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RejectSMRRequest'
+      responses:
+        '200':
+          description: SMR rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMRRecommendationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: SMR not in PENDING status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cases/{caseId}/smr-recommendation/resubmit:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Resubmit SMR recommendation after rejection
+      description: |
+        Resubmit a rejected SMR recommendation with revised narrative.
+
+        **State Transition**: SMR status REJECTED -> PENDING
+
+        **Roles**: L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-023, EC-010
+      operationId: resubmitSMRRecommendation
+      tags:
+        - SMR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResubmitSMRRequest'
+      responses:
+        '200':
+          description: SMR resubmitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMRRecommendationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: SMR not in REJECTED status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cases/{caseId}/smr-recommendation/record-reference:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Record AUSTRAC reference number
+      description: |
+        Record the AUSTRAC reference number after manual SMR submission.
+
+        **Precondition**: SMR must be APPROVED.
+
+        **State Transition**: Case CLOSED -> SMR_FILED, SMR APPROVED -> FILED
+
+        **No Withdrawal**: Approved SMRs cannot be withdrawn (FR-043).
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-041, FR-042, FR-043, US-11
+      operationId: recordAUSTRACReference
+      tags:
+        - SMR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordAUSTRACReferenceRequest'
+      responses:
+        '200':
+          description: AUSTRAC reference recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMRRecommendationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: SMR not in APPROVED status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cases/{caseId}/smr-draft:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Download SMR draft document
+      description: |
+        Download the generated SMR draft document for manual AUSTRAC submission.
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-040
+      operationId: downloadSMRDraft
+      tags:
+        - SMR
+      responses:
+        '200':
+          description: SMR draft document
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: SMR draft not found (SMR may not be approved)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # --------------------------------------------------------------------------
+  # EDD Checklist
+  # --------------------------------------------------------------------------
+
+  /cases/{caseId}/edd-checklist:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Get EDD checklist
+      description: |
+        Retrieve EDD checklist for a PEP case.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-033, US-7
+      operationId: getEDDChecklist
+      tags:
+        - EDD
+      responses:
+        '200':
+          description: EDD checklist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EDDChecklistResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      summary: Submit EDD checklist
+      description: |
+        Submit completed EDD checklist for a PEP case.
+
+        **Side Effects**:
+        - Clears onboarding block via Spriggy API callback (FR-028)
+        - Creates audit trail entry
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-033, FR-034, US-7
+      operationId: submitEDDChecklist
+      tags:
+        - EDD
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitEDDChecklistRequest'
+      responses:
+        '201':
+          description: EDD checklist submitted, block cleared
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EDDChecklistResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: EDD checklist already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Case is not a PEP-EDD-REQUIRED case
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # --------------------------------------------------------------------------
+  # Onboarding Blocks
+  # --------------------------------------------------------------------------
+
+  /cases/{caseId}/onboarding-block:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Get onboarding block status
+      description: |
+        Retrieve onboarding block status for a case.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: US-6, EC-009
+      operationId: getOnboardingBlock
+      tags:
+        - Onboarding
+      responses:
+        '200':
+          description: Onboarding block status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnboardingBlockResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cases/{caseId}/onboarding-block/clear:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    post:
+      summary: Clear onboarding block
+      description: |
+        Clear an onboarding block after analyst disposition.
+
+        **Side Effects**:
+        - Calls Spriggy onboarding service API (FR-028)
+        - Updates syncStatus (PENDING_SYNC -> SYNCED or SYNC_FAILED)
+
+        **Resilience**: Circuit breaker with retry on API failure (D3, EC-009).
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER (L1 cannot clear sanctions - FR-016)
+
+        **Source Requirements**: FR-028, FR-016, US-6, US-7
+      operationId: clearOnboardingBlock
+      tags:
+        - Onboarding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClearOnboardingBlockRequest'
+      responses:
+        '200':
+          description: Block cleared (or pending sync)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnboardingBlockResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: L1 cannot clear sanctions blocks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: L1_CANNOT_CLEAR_SANCTIONS
+                message: L1 analysts cannot clear sanctions blocks
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Block already cleared or no block exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Spriggy API unavailable (block queued for retry)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: EXTERNAL_SERVICE_UNAVAILABLE
+                message: Spriggy onboarding service temporarily unavailable. Block clearance queued for retry.
+                details:
+                  syncStatus: PENDING_SYNC
+                  retryScheduled: true
+
+  # --------------------------------------------------------------------------
+  # Dashboard Endpoints
+  # --------------------------------------------------------------------------
+
+  /dashboard/my-cases:
+    get:
+      summary: Get current user's assigned cases
+      description: |
+        Retrieve cases assigned to the current user, ordered by SLA urgency.
+
+        **Polling**: Designed for 30-second polling interval (D6).
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+
+        **Source Requirements**: FR-024, FR-025, US-12
+      operationId: getMyCases
+      tags:
+        - Dashboard
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Assigned cases
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardCasesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /dashboard/metrics:
+    get:
+      summary: Get dashboard metrics
+      description: |
+        Retrieve summary metrics for the analyst dashboard.
+
+        **Polling**: Designed for 30-second polling interval (D6).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: US-12
+      operationId: getDashboardMetrics
+      tags:
+        - Dashboard
+      responses:
+        '200':
+          description: Dashboard metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardMetricsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /dashboard/queue-metrics:
+    get:
+      summary: Get unassigned queue metrics
+      description: |
+        Retrieve metrics for unassigned case queue (manager oversight).
+
+        **Roles**: AML_MANAGER
+
+        **Source Requirements**: D13
+      operationId: getQueueMetrics
+      tags:
+        - Dashboard
+      responses:
+        '200':
+          description: Queue metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueMetricsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # --------------------------------------------------------------------------
+  # Notifications
+  # --------------------------------------------------------------------------
+
+  /notifications:
+    get:
+      summary: List user notifications
+      description: |
+        Retrieve notifications for the current user.
+
+        **Polling**: Designed for 30-second polling interval (D6).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-066, FR-067, FR-068, FR-069
+      operationId: listNotifications
+      tags:
+        - Notifications
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: unreadOnly
+          in: query
+          description: Filter to unread notifications only
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: User notifications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/unread-count:
+    get:
+      summary: Get unread notification count
+      description: |
+        Retrieve count of unread notifications for dashboard badge.
+
+        **Polling**: Designed for 30-second polling interval (D6).
+
+        **Roles**: All authenticated users
+      operationId: getUnreadNotificationCount
+      tags:
+        - Notifications
+      responses:
+        '200':
+          description: Unread count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unreadCount:
+                    type: integer
+                    example: 5
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/{notificationId}/read:
+    parameters:
+      - name: notificationId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    post:
+      summary: Mark notification as read
+      description: |
+        Mark a notification as read.
+
+        **Roles**: All authenticated users
+      operationId: markNotificationRead
+      tags:
+        - Notifications
+      responses:
+        '200':
+          description: Notification marked read
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notifications/read-all:
+    post:
+      summary: Mark all notifications as read
+      description: |
+        Mark all unread notifications as read.
+
+        **Roles**: All authenticated users
+      operationId: markAllNotificationsRead
+      tags:
+        - Notifications
+      responses:
+        '200':
+          description: All notifications marked read
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  markedReadCount:
+                    type: integer
+                    example: 12
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # --------------------------------------------------------------------------
+  # Reports
+  # --------------------------------------------------------------------------
+
+  /reports/case-volumes:
+    get:
+      summary: Get case volume report
+      description: |
+        Retrieve case volumes by type, status, and time period.
+
+        **Data Source**: Materialized view on read replica (D7).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-070
+      operationId: getCaseVolumeReport
+      tags:
+        - Reports
+      parameters:
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: endDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: groupBy
+          in: query
+          description: Grouping dimension
+          schema:
+            type: string
+            enum: [day, week, month]
+            default: day
+      responses:
+        '200':
+          description: Case volume report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseVolumeReportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /reports/sla-compliance:
+    get:
+      summary: Get SLA compliance report
+      description: |
+        Retrieve SLA compliance metrics by case type and time period.
+
+        **Data Source**: Materialized view on read replica (D7).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-070
+      operationId: getSLAComplianceReport
+      tags:
+        - Reports
+      parameters:
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: endDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: SLA compliance report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLAComplianceReportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /reports/smr-filings:
+    get:
+      summary: Get SMR filing report
+      description: |
+        Retrieve SMR filing volumes and metrics.
+
+        **Data Source**: Materialized view on read replica (D7).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-071
+      operationId: getSMRFilingReport
+      tags:
+        - Reports
+      parameters:
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: endDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: SMR filing report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SMRFilingReportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /reports/aged-cases:
+    get:
+      summary: Get aged cases report
+      description: |
+        Retrieve cases that have exceeded normal processing time (FR-073).
+
+        **Data Source**: Materialized view on read replica (D7).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-073
+      operationId: getAgedCasesReport
+      tags:
+        - Reports
+      parameters:
+        - name: ageThresholdDays
+          in: query
+          description: Minimum age in days to include
+          schema:
+            type: integer
+            default: 30
+      responses:
+        '200':
+          description: Aged cases report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgedCasesReportResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /reports/export:
+    post:
+      summary: Export report data
+      description: |
+        Export report data in CSV or Excel format for governance presentation.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-072
+      operationId: exportReport
+      tags:
+        - Reports
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportReportRequest'
+      responses:
+        '200':
+          description: Exported report file
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            text/csv:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # --------------------------------------------------------------------------
+  # Case Timeline and Audit
+  # --------------------------------------------------------------------------
+
+  /cases/{caseId}/timeline:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Get case timeline
+      description: |
+        Retrieve immutable timeline entries for a case.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-058
+      operationId: getCaseTimeline
+      tags:
+        - Cases
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Case timeline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimelineListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cases/{caseId}/audit-log:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: Get case audit log
+      description: |
+        Retrieve complete audit log for a case (regulatory export).
+
+        **Roles**: AML_MANAGER, READ_ONLY
+
+        **Source Requirements**: FR-062
+      operationId: getCaseAuditLog
+      tags:
+        - Cases
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Case audit log
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLogListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # Communication Templates
+  # --------------------------------------------------------------------------
+
+  /communication-templates:
+    get:
+      summary: List communication templates
+      description: |
+        Retrieve available communication templates, optionally filtered by case type.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-053, D10
+      operationId: listCommunicationTemplates
+      tags:
+        - Communications
+      parameters:
+        - name: caseType
+          in: query
+          description: Filter templates by applicable case type
+          schema:
+            $ref: '#/components/schemas/CaseType'
+      responses:
+        '200':
+          description: Communication templates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommunicationTemplateListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # --------------------------------------------------------------------------
+  # Documents
+  # --------------------------------------------------------------------------
+
+  /cases/{caseId}/documents:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+
+    get:
+      summary: List case documents
+      description: |
+        Retrieve documents attached to a case.
+
+        **Roles**: All authenticated users
+      operationId: listCaseDocuments
+      tags:
+        - Cases
+      responses:
+        '200':
+          description: Case documents
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      summary: Upload document to case
+      description: |
+        Upload an evidence document to a case.
+
+        **Roles**: L1_ANALYST, L2_ANALYST, AML_MANAGER
+      operationId: uploadDocument
+      tags:
+        - Cases
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+                - documentType
+              properties:
+                file:
+                  type: string
+                  format: binary
+                documentType:
+                  $ref: '#/components/schemas/DocumentType'
+                description:
+                  type: string
+                  maxLength: 500
+      responses:
+        '201':
+          description: Document uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          description: File too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cases/{caseId}/documents/{documentId}:
+    parameters:
+      - $ref: '#/components/parameters/CaseIdParam'
+      - name: documentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      summary: Download document
+      description: |
+        Download a case document.
+
+        **Roles**: All authenticated users
+      operationId: downloadDocument
+      tags:
+        - Cases
+      responses:
+        '200':
+          description: Document file
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # Users
+  # --------------------------------------------------------------------------
+
+  /users/me:
+    get:
+      summary: Get current user
+      description: |
+        Retrieve the authenticated user's profile.
+
+        **Roles**: All authenticated users
+      operationId: getCurrentUser
+      tags:
+        - Users
+      responses:
+        '200':
+          description: Current user profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users:
+    get:
+      summary: List users
+      description: |
+        Retrieve list of system users.
+
+        **Roles**: AML_MANAGER
+      operationId: listUsers
+      tags:
+        - Users
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: role
+          in: query
+          schema:
+            $ref: '#/components/schemas/UserRole'
+        - name: isActive
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: User list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /users/{userId}/role:
+    parameters:
+      - name: userId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    put:
+      summary: Update user role
+      description: |
+        Update a user's system role.
+
+        **Side Effect**: All cases assigned to user are returned to unassigned queue (FR-026, FR-027).
+
+        **Roles**: AML_MANAGER
+
+        **Source Requirements**: FR-026, FR-027, US-14
+      operationId: updateUserRole
+      tags:
+        - Users
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRoleRequest'
+      responses:
+        '200':
+          description: Role updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --------------------------------------------------------------------------
+  # Configuration
+  # --------------------------------------------------------------------------
+
+  /config/pep-threshold:
+    get:
+      summary: Get current PEP threshold
+      description: |
+        Retrieve current PEP confidence score threshold configuration.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-030, EC-011
+      operationId: getPEPThreshold
+      tags:
+        - Configuration
+      responses:
+        '200':
+          description: PEP threshold configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PEPThresholdResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    put:
+      summary: Update PEP threshold
+      description: |
+        Update PEP confidence score threshold.
+
+        **Roles**: AML_MANAGER
+
+        **Source Requirements**: FR-030
+      operationId: updatePEPThreshold
+      tags:
+        - Configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePEPThresholdRequest'
+      responses:
+        '200':
+          description: Threshold updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PEPThresholdResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /config/sla-warning-threshold:
+    get:
+      summary: Get SLA warning threshold
+      description: |
+        Retrieve current SLA warning threshold configuration.
+
+        Cases approaching this percentage of their SLA deadline trigger warning notifications (FR-050).
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: FR-050, US-9, D2
+      operationId: getSLAWarningThreshold
+      tags:
+        - Configuration
+      responses:
+        '200':
+          description: SLA warning threshold configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLAWarningThresholdResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    put:
+      summary: Update SLA warning threshold
+      description: |
+        Update SLA warning threshold percentage.
+
+        Threshold is expressed as a percentage (0-100). Default is 80, meaning warnings trigger
+        when 80% of the SLA timeline has elapsed.
+
+        **Roles**: AML_MANAGER
+
+        **Source Requirements**: FR-050, D2
+      operationId: updateSLAWarningThreshold
+      tags:
+        - Configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSLAWarningThresholdRequest'
+      responses:
+        '200':
+          description: Threshold updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLAWarningThresholdResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /config/holidays:
+    get:
+      summary: List holiday overrides
+      description: |
+        Retrieve custom holiday dates for SLA calculation.
+
+        **Roles**: All authenticated users
+
+        **Source Requirements**: D2, FR-048
+      operationId: listHolidayOverrides
+      tags:
+        - Configuration
+      parameters:
+        - name: year
+          in: query
+          description: Filter by year
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Holiday overrides
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HolidayOverrideListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      summary: Add holiday override
+      description: |
+        Add a custom holiday date for SLA calculation.
+
+        **Roles**: AML_MANAGER
+      operationId: addHolidayOverride
+      tags:
+        - Configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddHolidayOverrideRequest'
+      responses:
+        '201':
+          description: Holiday added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HolidayOverrideResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Holiday already exists for this date
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+# ============================================================================
+# COMPONENTS
+# ============================================================================
+
+components:
+  # --------------------------------------------------------------------------
+  # Security Schemes
+  # --------------------------------------------------------------------------
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT access token from OIDC SSO
+
+  # --------------------------------------------------------------------------
+  # Common Parameters
+  # --------------------------------------------------------------------------
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      description: Page number (1-indexed)
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+
+    LimitParam:
+      name: limit
+      in: query
+      description: Items per page
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    CaseIdParam:
+      name: caseId
+      in: path
+      required: true
+      description: Case unique identifier
+      schema:
+        type: string
+        format: uuid
+
+    WebhookSignature:
+      name: X-Signature-256
+      in: header
+      required: true
+      description: HMAC-SHA256 signature of request body
+      schema:
+        type: string
+
+    WebhookTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      description: ISO8601 timestamp of webhook generation
+      schema:
+        type: string
+        format: date-time
+
+  # --------------------------------------------------------------------------
+  # Common Responses
+  # --------------------------------------------------------------------------
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: VALIDATION_ERROR
+            message: One or more fields are invalid
+
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: UNAUTHORIZED
+            message: Authentication required
+
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: FORBIDDEN
+            message: You do not have permission to access this resource
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: NOT_FOUND
+            message: The requested resource was not found
+
+    VersionConflict:
+      description: Optimistic locking conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/VersionConflictResponse'
+          example:
+            code: VERSION_CONFLICT
+            message: Case was modified by another user
+            details:
+              currentVersion: 5
+              yourVersion: 3
+
+  # --------------------------------------------------------------------------
+  # Schemas
+  # --------------------------------------------------------------------------
+
+  schemas:
+    # --- Error Schemas ---
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          description: Human-readable message
+          example: One or more fields are invalid
+        details:
+          type: object
+          additionalProperties: true
+          description: Additional error context
+
+    VersionConflictResponse:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            details:
+              type: object
+              properties:
+                currentVersion:
+                  type: integer
+                  description: Current version in database
+                yourVersion:
+                  type: integer
+                  description: Version you attempted to update
+
+    # --- Enums ---
+
+    CaseType:
+      type: string
+      enum:
+        - KYC_REMEDIATION
+        - PEP_SANCTIONS_SCREENING
+        - SUSPICIOUS_ACTIVITY
+        - SUPPLEMENTARY_SMR
+
+    CaseSubtype:
+      type: string
+      enum:
+        - SANCTIONS_ONBOARDING
+        - SANCTIONS_EXISTING_CUSTOMER
+        - PEP_EDD_REQUIRED
+        - PEP_PROVISIONAL_REVIEW
+
+    CaseStatus:
+      type: string
+      enum:
+        - OPEN
+        - IN_PROGRESS
+        - PENDING_INFORMATION
+        - ESCALATED
+        - PENDING_APPROVAL
+        - CLOSED
+        - SMR_FILED
+
+    L2ReviewStatus:
+      type: string
+      enum:
+        - NOT_REQUIRED
+        - PENDING_REVIEW
+        - REVIEWED_ACCEPTED
+        - REVIEWED_REOPENED
+
+    Tier:
+      type: string
+      enum:
+        - L1
+        - L2
+
+    UserRole:
+      type: string
+      enum:
+        - L1_ANALYST
+        - L2_ANALYST
+        - AML_MANAGER
+        - READ_ONLY
+
+    AlertSource:
+      type: string
+      enum:
+        - GREENID
+        - INDUE
+
+    ClosureDisposition:
+      type: string
+      enum:
+        - FALSE_POSITIVE
+        - SATISFACTORY_EXPLANATION
+        - NO_FURTHER_ACTION
+        - ACCOUNT_RESTRICTIONS_RECOMMENDED
+
+    SMRStatus:
+      type: string
+      enum:
+        - PENDING
+        - APPROVED
+        - REJECTED
+        - FILED
+
+    InvestigationConclusion:
+      type: string
+      enum:
+        - NO_SUSPICION
+        - SUSPICIOUS_ACTIVITY_IDENTIFIED
+        - INSUFFICIENT_EVIDENCE
+        - FURTHER_MONITORING_REQUIRED
+
+    BlockType:
+      type: string
+      enum:
+        - SANCTIONS
+        - PEP_EDD_REQUIRED
+
+    SyncStatus:
+      type: string
+      enum:
+        - SYNCED
+        - PENDING_SYNC
+        - SYNC_FAILED
+
+    NotificationType:
+      type: string
+      enum:
+        - CASE_ASSIGNED
+        - SLA_WARNING
+        - SLA_BREACH
+        - ESCALATION
+        - SMR_PENDING_APPROVAL
+        - SMR_APPROVED
+        - SMR_REJECTED
+
+    DocumentType:
+      type: string
+      enum:
+        - SMR_DRAFT
+        - EVIDENCE
+        - CUSTOMER_DOCUMENT
+        - OTHER
+
+    CommunicationDirection:
+      type: string
+      enum:
+        - OUTBOUND
+        - INBOUND
+
+    CommunicationChannel:
+      type: string
+      enum:
+        - EMAIL
+        - IN_APP
+        - PHONE
+        - OTHER
+
+    EnhancedMonitoringFrequency:
+      type: string
+      enum:
+        - WEEKLY
+        - MONTHLY
+        - QUARTERLY
+        - ANNUALLY
+
+    # --- Webhook Schemas ---
+
+    GreenIdWebhookPayload:
+      type: object
+      required:
+        - alertId
+        - customerId
+        - alertType
+        - matchData
+        - timestamp
+      properties:
+        alertId:
+          type: string
+          description: GreenID alert identifier
+        customerId:
+          type: string
+          description: Spriggy customer identifier
+        alertType:
+          type: string
+          enum: [SANCTIONS, PEP]
+          description: Type of screening alert
+        confidenceScore:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          description: Match confidence score (PEP alerts only)
+        matchData:
+          type: object
+          description: Screening match details
+          properties:
+            matchedName:
+              type: string
+            matchedList:
+              type: string
+            matchReasons:
+              type: array
+              items:
+                type: string
+        customerOnboardingStatus:
+          type: string
+          enum: [IN_PROGRESS, COMPLETED]
+          description: Customer's onboarding status at alert time
+        timestamp:
+          type: string
+          format: date-time
+          description: Alert generation time
+
+    IndueWebhookPayload:
+      type: object
+      required:
+        - alertId
+        - customerId
+        - alertType
+        - alertDetails
+        - timestamp
+      properties:
+        alertId:
+          type: string
+          description: Indue alert identifier
+        customerId:
+          type: string
+          description: Spriggy customer identifier
+        alertType:
+          type: string
+          enum: [SUSPICIOUS_TRANSACTION, UNUSUAL_PATTERN, THRESHOLD_BREACH]
+        alertDetails:
+          type: object
+          description: Transaction monitoring alert details
+          properties:
+            ruleTriggered:
+              type: string
+            transactionIds:
+              type: array
+              items:
+                type: string
+            totalAmount:
+              type: number
+            currency:
+              type: string
+        customerOnboardingStatus:
+          type: string
+          enum: [IN_PROGRESS, COMPLETED]
+          description: |
+            Customer's onboarding status when alert was triggered.
+            - IN_PROGRESS: Customer is still being onboarded (onboarding alerts per FR-036)
+            - COMPLETED: Customer onboarding is complete (existing customer alerts per FR-037)
+            Used to distinguish between onboarding alerts (which may trigger blocks) and
+            existing customer alerts (which require analyst discretion on restrictions).
+        timestamp:
+          type: string
+          format: date-time
+
+    WebhookAcceptedResponse:
+      type: object
+      required:
+        - received
+        - caseId
+        - caseReference
+      properties:
+        received:
+          type: boolean
+          example: true
+        caseId:
+          type: string
+          format: uuid
+          description: Created case ID
+        caseReference:
+          type: string
+          description: Human-readable case reference
+          example: AML-1001
+
+    WebhookDuplicateResponse:
+      type: object
+      required:
+        - duplicate
+        - existingCaseId
+        - existingCaseReference
+      properties:
+        duplicate:
+          type: boolean
+          example: true
+        existingCaseId:
+          type: string
+          format: uuid
+        existingCaseReference:
+          type: string
+          example: AML-1001
+        message:
+          type: string
+          example: Duplicate webhook linked to existing case
+
+    # --- Case Schemas ---
+
+    CaseSummary:
+      type: object
+      required:
+        - id
+        - referenceCode
+        - caseType
+        - status
+        - tier
+        - slaDeadline
+        - slaStatus
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        referenceCode:
+          type: string
+          example: AML-1001
+        caseType:
+          $ref: '#/components/schemas/CaseType'
+        caseSubtype:
+          $ref: '#/components/schemas/CaseSubtype'
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        tier:
+          $ref: '#/components/schemas/Tier'
+        slaDeadline:
+          type: string
+          format: date-time
+        slaStatus:
+          type: string
+          enum: [on_track, warning, breached]
+        slaBreached:
+          type: boolean
+        l2ReviewStatus:
+          $ref: '#/components/schemas/L2ReviewStatus'
+        assignedUser:
+          $ref: '#/components/schemas/UserSummary'
+        customer:
+          $ref: '#/components/schemas/CustomerSummary'
+        createdAt:
+          type: string
+          format: date-time
+        closedAt:
+          type: string
+          format: date-time
+
+    CaseDetailResponse:
+      allOf:
+        - $ref: '#/components/schemas/CaseSummary'
+        - type: object
+          required:
+            - version
+          properties:
+            referenceNumber:
+              type: integer
+            source:
+              $ref: '#/components/schemas/AlertSource'
+            sourceAlertId:
+              type: string
+            pepConfidenceScore:
+              type: number
+              format: float
+            hasCombinedAlert:
+              type: boolean
+            version:
+              type: integer
+              description: Optimistic lock version
+            updatedAt:
+              type: string
+              format: date-time
+            linkedCases:
+              type: array
+              items:
+                $ref: '#/components/schemas/LinkedCaseSummary'
+            hasOnboardingBlock:
+              type: boolean
+            hasEDDChecklist:
+              type: boolean
+            hasSMRRecommendation:
+              type: boolean
+            hasInvestigationFindings:
+              type: boolean
+
+    CaseListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseSummary'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    LinkedCaseSummary:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        referenceCode:
+          type: string
+        linkType:
+          type: string
+          enum: [SUPPLEMENTARY_TO_ORIGINAL, RELATED, SAME_CUSTOMER]
+        direction:
+          type: string
+          enum: [source, target]
+
+    ClaimCaseRequest:
+      type: object
+      required:
+        - version
+      properties:
+        version:
+          type: integer
+          description: Current case version for optimistic locking
+
+    CloseCaseRequest:
+      type: object
+      required:
+        - version
+        - disposition
+        - justification
+      properties:
+        version:
+          type: integer
+        disposition:
+          $ref: '#/components/schemas/ClosureDisposition'
+        justification:
+          type: string
+          minLength: 50
+          description: Required closure justification
+
+    EscalateCaseRequest:
+      type: object
+      required:
+        - version
+        - escalationReason
+      properties:
+        version:
+          type: integer
+        escalationReason:
+          type: string
+          minLength: 50
+          description: Documented reasoning for escalation
+
+    ReopenCaseRequest:
+      type: object
+      required:
+        - version
+        - reopenReason
+      properties:
+        version:
+          type: integer
+        reopenReason:
+          type: string
+          minLength: 50
+          description: Reason for overturning L1 closure
+
+    CreateSupplementaryCaseRequest:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          minLength: 50
+          description: Reason for supplementary filing
+
+    # --- Customer Schemas ---
+
+    CustomerSummary:
+      type: object
+      description: |
+        Customer snapshot captured at case creation time.
+
+        **Immutability**: Customer data is captured as a snapshot when the case is created.
+        Subsequent changes to the customer's profile in Spriggy do not update this snapshot.
+        This ensures case context reflects the state at the time of the alert, which is
+        important for audit and investigation purposes. If updated customer information
+        is needed, analysts can reference Spriggy's customer management system directly.
+      required:
+        - id
+        - externalId
+      properties:
+        id:
+          type: string
+          format: uuid
+        externalId:
+          type: string
+          description: Spriggy customer identifier
+        displayName:
+          type: string
+          description: Masked or authorized display name
+        accountStatus:
+          type: string
+          enum: [ACTIVE, SUSPENDED, CLOSED]
+          description: Customer account status at time of case creation (snapshot)
+        onboardingStatus:
+          type: string
+          enum: [IN_PROGRESS, COMPLETED, BLOCKED, UNKNOWN]
+          description: Customer onboarding status at time of case creation (snapshot)
+        snapshotAt:
+          type: string
+          format: date-time
+          description: Timestamp when this customer data snapshot was captured
+
+    # --- User Schemas ---
+
+    UserSummary:
+      type: object
+      required:
+        - id
+        - displayName
+        - role
+      properties:
+        id:
+          type: string
+          format: uuid
+        displayName:
+          type: string
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    UserResponse:
+      type: object
+      required:
+        - id
+        - email
+        - role
+        - isActive
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        displayName:
+          type: string
+        role:
+          $ref: '#/components/schemas/UserRole'
+        isActive:
+          type: boolean
+        lastLoginAt:
+          type: string
+          format: date-time
+        roleChangedAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+
+    UserListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    UpdateUserRoleRequest:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    # --- Communication Schemas ---
+
+    RequestInformationRequest:
+      type: object
+      required:
+        - version
+        - templateId
+        - channel
+        - content
+      properties:
+        version:
+          type: integer
+        templateId:
+          type: string
+          description: Communication template ID
+        channel:
+          $ref: '#/components/schemas/CommunicationChannel'
+        content:
+          type: string
+          description: Rendered communication content
+
+    RecordResponseRequest:
+      type: object
+      required:
+        - version
+        - customerResponse
+        - responseAssessment
+      properties:
+        version:
+          type: integer
+        customerResponse:
+          type: string
+          description: Customer's response content
+        responseAssessment:
+          type: string
+          minLength: 20
+          description: Analyst assessment of the response
+        respondedAt:
+          type: string
+          format: date-time
+          description: When customer responded
+
+    CommunicationTemplateResponse:
+      type: object
+      required:
+        - id
+        - name
+        - version
+        - content
+        - applicableCaseTypes
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        content:
+          type: string
+        placeholders:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              type:
+                type: string
+              required:
+                type: boolean
+        applicableCaseTypes:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseType'
+
+    CommunicationTemplateListResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommunicationTemplateResponse'
+
+    # --- Investigation Findings Schemas ---
+
+    InvestigationFindingsResponse:
+      type: object
+      required:
+        - id
+        - caseId
+        - conclusion
+        - completedAt
+        - completedBy
+      properties:
+        id:
+          type: string
+          format: uuid
+        caseId:
+          type: string
+          format: uuid
+        entitiesInvolved:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvolvedEntity'
+        transactionPatterns:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionPattern'
+        suspiciousIndicators:
+          type: array
+          items:
+            $ref: '#/components/schemas/SuspiciousIndicator'
+        conclusion:
+          $ref: '#/components/schemas/InvestigationConclusion'
+        notes:
+          type: string
+        completedAt:
+          type: string
+          format: date-time
+        completedBy:
+          $ref: '#/components/schemas/UserSummary'
+
+    InvolvedEntity:
+      type: object
+      required:
+        - entityType
+        - name
+      properties:
+        entityType:
+          type: string
+          enum: [PERSON, BUSINESS, ACCOUNT, OTHER]
+        identifier:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+        notes:
+          type: string
+
+    TransactionPattern:
+      type: object
+      required:
+        - patternType
+        - description
+      properties:
+        patternType:
+          type: string
+        description:
+          type: string
+        dateRange:
+          type: object
+          properties:
+            from:
+              type: string
+              format: date
+            to:
+              type: string
+              format: date
+        totalAmount:
+          type: number
+        transactionCount:
+          type: integer
+
+    SuspiciousIndicator:
+      type: object
+      required:
+        - indicatorCode
+        - description
+        - severity
+      properties:
+        indicatorCode:
+          type: string
+        description:
+          type: string
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH]
+        evidence:
+          type: string
+
+    CreateInvestigationFindingsRequest:
+      type: object
+      required:
+        - conclusion
+      properties:
+        entitiesInvolved:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvolvedEntity'
+        transactionPatterns:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionPattern'
+        suspiciousIndicators:
+          type: array
+          items:
+            $ref: '#/components/schemas/SuspiciousIndicator'
+        conclusion:
+          $ref: '#/components/schemas/InvestigationConclusion'
+        notes:
+          type: string
+
+    UpdateInvestigationFindingsRequest:
+      type: object
+      properties:
+        entitiesInvolved:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvolvedEntity'
+        transactionPatterns:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionPattern'
+        suspiciousIndicators:
+          type: array
+          items:
+            $ref: '#/components/schemas/SuspiciousIndicator'
+        conclusion:
+          $ref: '#/components/schemas/InvestigationConclusion'
+        notes:
+          type: string
+
+    # --- SMR Schemas ---
+
+    SMRRecommendationResponse:
+      type: object
+      required:
+        - id
+        - caseId
+        - status
+        - narrative
+        - reasonForSuspicion
+        - recommendingUser
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        caseId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/SMRStatus'
+        narrative:
+          type: string
+        reasonForSuspicion:
+          type: string
+        evidenceReferences:
+          type: array
+          items:
+            type: string
+        recommendingUser:
+          $ref: '#/components/schemas/UserSummary'
+        rejectionCount:
+          type: integer
+        rejectionHistory:
+          type: array
+          items:
+            $ref: '#/components/schemas/SMRRejection'
+        approvingUser:
+          $ref: '#/components/schemas/UserSummary'
+        approvedAt:
+          type: string
+          format: date-time
+        austracReferenceNumber:
+          type: string
+        austracFiledAt:
+          type: string
+          format: date-time
+        isSupplementary:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    SMRRejection:
+      type: object
+      properties:
+        rejectedAt:
+          type: string
+          format: date-time
+        rejectedBy:
+          $ref: '#/components/schemas/UserSummary'
+        reason:
+          type: string
+
+    CreateSMRRecommendationRequest:
+      type: object
+      required:
+        - narrative
+        - reasonForSuspicion
+      properties:
+        narrative:
+          type: string
+          minLength: 100
+          description: Detailed narrative description
+        reasonForSuspicion:
+          type: string
+          minLength: 50
+          description: Why activity is suspicious
+        evidenceReferences:
+          type: array
+          items:
+            type: string
+          description: References to evidence documents
+
+    ApproveSMRRequest:
+      type: object
+      properties:
+        approvalNotes:
+          type: string
+          description: Optional approval notes
+
+    SMRApprovalResponse:
+      allOf:
+        - $ref: '#/components/schemas/SMRRecommendationResponse'
+        - type: object
+          properties:
+            smrDraftGenerated:
+              type: boolean
+            smrDraftId:
+              type: string
+              format: uuid
+
+    RejectSMRRequest:
+      type: object
+      required:
+        - rejectionReason
+      properties:
+        rejectionReason:
+          type: string
+          minLength: 50
+          description: Reason for rejection with feedback
+
+    ResubmitSMRRequest:
+      type: object
+      required:
+        - narrative
+        - reasonForSuspicion
+      properties:
+        narrative:
+          type: string
+          minLength: 100
+        reasonForSuspicion:
+          type: string
+          minLength: 50
+        evidenceReferences:
+          type: array
+          items:
+            type: string
+
+    RecordAUSTRACReferenceRequest:
+      type: object
+      required:
+        - austracReferenceNumber
+      properties:
+        austracReferenceNumber:
+          type: string
+          minLength: 1
+          maxLength: 50
+          description: AUSTRAC filing reference number
+
+    # --- EDD Schemas ---
+
+    EDDChecklistResponse:
+      type: object
+      required:
+        - id
+        - caseId
+        - sourceOfWealth
+        - sourceOfFunds
+        - relationshipPurpose
+        - enhancedMonitoringFrequency
+        - completedAt
+        - completedBy
+      properties:
+        id:
+          type: string
+          format: uuid
+        caseId:
+          type: string
+          format: uuid
+        sourceOfWealth:
+          type: string
+        sourceOfFunds:
+          type: string
+        relationshipPurpose:
+          type: string
+        enhancedMonitoringFrequency:
+          $ref: '#/components/schemas/EnhancedMonitoringFrequency'
+        additionalNotes:
+          type: string
+        completedAt:
+          type: string
+          format: date-time
+        completedBy:
+          $ref: '#/components/schemas/UserSummary'
+
+    SubmitEDDChecklistRequest:
+      type: object
+      required:
+        - sourceOfWealth
+        - sourceOfFunds
+        - relationshipPurpose
+        - enhancedMonitoringFrequency
+      properties:
+        sourceOfWealth:
+          type: string
+          minLength: 50
+        sourceOfFunds:
+          type: string
+          minLength: 50
+        relationshipPurpose:
+          type: string
+          minLength: 20
+        enhancedMonitoringFrequency:
+          $ref: '#/components/schemas/EnhancedMonitoringFrequency'
+        additionalNotes:
+          type: string
+
+    # --- Onboarding Block Schemas ---
+
+    OnboardingBlockResponse:
+      type: object
+      required:
+        - id
+        - caseId
+        - customerId
+        - blockType
+        - syncStatus
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        caseId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        blockType:
+          $ref: '#/components/schemas/BlockType'
+        blockReason:
+          type: string
+        syncStatus:
+          $ref: '#/components/schemas/SyncStatus'
+        lastSyncAttempt:
+          type: string
+          format: date-time
+        syncAttemptCount:
+          type: integer
+        clearedAt:
+          type: string
+          format: date-time
+        clearedBy:
+          $ref: '#/components/schemas/UserSummary'
+        createdAt:
+          type: string
+          format: date-time
+
+    ClearOnboardingBlockRequest:
+      type: object
+      required:
+        - clearanceReason
+      properties:
+        clearanceReason:
+          type: string
+          minLength: 20
+          description: Reason for clearing the block
+
+    AcceptL1ClosureRequest:
+      type: object
+      properties:
+        reviewNotes:
+          type: string
+          description: Optional review notes
+
+    # --- Dashboard Schemas ---
+
+    DashboardCasesResponse:
+      type: object
+      required:
+        - data
+        - pagination
+        - metrics
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseSummary'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        metrics:
+          type: object
+          properties:
+            totalAssigned:
+              type: integer
+            atRisk:
+              type: integer
+            breached:
+              type: integer
+
+    DashboardMetricsResponse:
+      type: object
+      properties:
+        myAssignedCount:
+          type: integer
+        myAtRiskCount:
+          type: integer
+        myBreachedCount:
+          type: integer
+        unassignedCount:
+          type: integer
+        pendingApprovalCount:
+          type: integer
+        l2ReviewQueueCount:
+          type: integer
+
+    QueueMetricsResponse:
+      type: object
+      properties:
+        totalUnassigned:
+          type: integer
+        byTier:
+          type: object
+          properties:
+            L1:
+              type: integer
+            L2:
+              type: integer
+        oldestUnassignedHours:
+          type: number
+        slaAtRiskCount:
+          type: integer
+
+    # --- Notification Schemas ---
+
+    NotificationResponse:
+      type: object
+      required:
+        - id
+        - notificationType
+        - title
+        - body
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        notificationType:
+          $ref: '#/components/schemas/NotificationType'
+        title:
+          type: string
+        body:
+          type: string
+        caseId:
+          type: string
+          format: uuid
+        caseReference:
+          type: string
+        readAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+
+    NotificationListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+        - unreadCount
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        unreadCount:
+          type: integer
+
+    # --- Report Schemas ---
+
+    CaseVolumeReportResponse:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            totalCases:
+              type: integer
+            totalClosed:
+              type: integer
+            totalOpen:
+              type: integer
+        byPeriod:
+          type: array
+          items:
+            type: object
+            properties:
+              period:
+                type: string
+              total:
+                type: integer
+              byCaseType:
+                type: object
+                additionalProperties:
+                  type: integer
+              byStatus:
+                type: object
+                additionalProperties:
+                  type: integer
+
+    SLAComplianceReportResponse:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            totalCases:
+              type: integer
+            slaMetCount:
+              type: integer
+            slaBreachedCount:
+              type: integer
+            complianceRate:
+              type: number
+              format: float
+        byCaseType:
+          type: array
+          items:
+            type: object
+            properties:
+              caseType:
+                $ref: '#/components/schemas/CaseType'
+              totalCases:
+                type: integer
+              slaMet:
+                type: integer
+              slaBreached:
+                type: integer
+              avgResolutionDays:
+                type: number
+
+    SMRFilingReportResponse:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            totalRecommended:
+              type: integer
+            totalApproved:
+              type: integer
+            totalRejected:
+              type: integer
+            totalFiled:
+              type: integer
+            pendingFiling:
+              type: integer
+        byMonth:
+          type: array
+          items:
+            type: object
+            properties:
+              month:
+                type: string
+              recommended:
+                type: integer
+              approved:
+                type: integer
+              filed:
+                type: integer
+
+    AgedCasesReportResponse:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            totalAgedCases:
+              type: integer
+            oldestCaseDays:
+              type: integer
+        cases:
+          type: array
+          items:
+            type: object
+            properties:
+              caseId:
+                type: string
+                format: uuid
+              referenceCode:
+                type: string
+              caseType:
+                $ref: '#/components/schemas/CaseType'
+              status:
+                $ref: '#/components/schemas/CaseStatus'
+              ageDays:
+                type: integer
+              assignedUser:
+                $ref: '#/components/schemas/UserSummary'
+
+    ExportReportRequest:
+      type: object
+      required:
+        - reportType
+        - format
+        - startDate
+        - endDate
+      properties:
+        reportType:
+          type: string
+          enum: [case_volumes, sla_compliance, smr_filings, aged_cases]
+        format:
+          type: string
+          enum: [csv, xlsx]
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+
+    # --- Timeline and Audit Schemas ---
+
+    TimelineEntryResponse:
+      type: object
+      required:
+        - id
+        - entryType
+        - action
+        - summary
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        entryType:
+          type: string
+          enum: [ACTION, NOTE, SYSTEM_EVENT, COMMUNICATION, VIEW, CLOSURE, REOPEN, ESCALATION, SLA_WARNING, SLA_BREACH]
+        action:
+          type: string
+        summary:
+          type: string
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        createdAt:
+          type: string
+          format: date-time
+
+    TimelineListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelineEntryResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    AuditLogEntryResponse:
+      type: object
+      required:
+        - id
+        - actionType
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        actionType:
+          type: string
+        actionDetail:
+          type: object
+          description: Structured action details (PII redacted)
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        ipAddress:
+          type: string
+        userAgent:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    AuditLogListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditLogEntryResponse'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    # --- Document Schemas ---
+
+    DocumentResponse:
+      type: object
+      required:
+        - id
+        - caseId
+        - filename
+        - contentType
+        - sizeBytes
+        - documentType
+        - uploadedBy
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        caseId:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        contentType:
+          type: string
+        sizeBytes:
+          type: integer
+        documentType:
+          $ref: '#/components/schemas/DocumentType'
+        uploadedBy:
+          $ref: '#/components/schemas/UserSummary'
+        createdAt:
+          type: string
+          format: date-time
+
+    DocumentListResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentResponse'
+
+    # --- Configuration Schemas ---
+
+    PEPThresholdResponse:
+      type: object
+      required:
+        - thresholdValue
+        - effectiveFrom
+      properties:
+        thresholdValue:
+          type: number
+          format: float
+          example: 80.0
+        effectiveFrom:
+          type: string
+          format: date-time
+        changedBy:
+          $ref: '#/components/schemas/UserSummary'
+
+    UpdatePEPThresholdRequest:
+      type: object
+      required:
+        - thresholdValue
+      properties:
+        thresholdValue:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+
+    SLAWarningThresholdResponse:
+      type: object
+      description: |
+        SLA warning threshold configuration. Warnings are triggered when this percentage
+        of the SLA timeline has elapsed (FR-050).
+      required:
+        - thresholdPercentage
+        - effectiveFrom
+      properties:
+        thresholdPercentage:
+          type: number
+          format: float
+          description: Percentage of SLA elapsed to trigger warning (default 80)
+          example: 80.0
+        effectiveFrom:
+          type: string
+          format: date-time
+          description: When this threshold became effective
+        changedBy:
+          $ref: '#/components/schemas/UserSummary'
+          description: User who last changed the threshold
+
+    UpdateSLAWarningThresholdRequest:
+      type: object
+      required:
+        - thresholdPercentage
+      properties:
+        thresholdPercentage:
+          type: number
+          format: float
+          minimum: 1
+          maximum: 99
+          description: Percentage of SLA elapsed to trigger warning (1-99)
+          example: 80.0
+
+    HolidayOverrideResponse:
+      type: object
+      required:
+        - id
+        - holidayDate
+        - description
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        holidayDate:
+          type: string
+          format: date
+        description:
+          type: string
+        region:
+          type: string
+        createdBy:
+          $ref: '#/components/schemas/UserSummary'
+        createdAt:
+          type: string
+          format: date-time
+
+    HolidayOverrideListResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/HolidayOverrideResponse'
+
+    AddHolidayOverrideRequest:
+      type: object
+      required:
+        - holidayDate
+        - description
+      properties:
+        holidayDate:
+          type: string
+          format: date
+        description:
+          type: string
+          maxLength: 200
+        region:
+          type: string
+          maxLength: 50
+
+    # --- Pagination ---
+
+    PaginationMeta:
+      type: object
+      required:
+        - page
+        - limit
+        - total
+        - totalPages
+      properties:
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+        total:
+          type: integer
+          example: 150
+        totalPages:
+          type: integer
+          example: 8
+        hasNext:
+          type: boolean
+        hasPrev:
+          type: boolean
+
+# ============================================================================
+# DEFAULT SECURITY
+# ============================================================================
+
+security:
+  - bearerAuth: []
